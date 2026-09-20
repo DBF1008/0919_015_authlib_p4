@@ -3,6 +3,7 @@ from flask import json
 from flask import request as flask_req
 from werkzeug.utils import import_string
 
+from authlib.common.log_context import bind_request_id_from_headers
 from authlib.common.security import generate_token
 from authlib.oauth2 import AuthorizationServer as _AuthorizationServer
 from authlib.oauth2.rfc6750 import BearerTokenGenerator
@@ -74,10 +75,30 @@ class AuthorizationServer(_AuthorizationServer):
             return uris.get(error.error)
 
     def create_oauth2_request(self, request):
+        bind_request_id_from_headers(flask_req.headers)
         return FlaskOAuth2Request(flask_req)
 
     def create_json_request(self, request):
+        bind_request_id_from_headers(flask_req.headers)
         return FlaskJsonRequest(flask_req)
+
+    def register_health_endpoint(self, app, path="/health", last_n=10):
+        """Register a ``/health`` endpoint on the Flask app. The endpoint
+        reports the token signer key status, registered grant types and
+        recent token issuance counters. It performs no grant or token
+        validation.
+
+        :param app: Flask app instance.
+        :param path: URL path for the endpoint, defaults to ``/health``.
+        :param last_n: number of recent token issuance events to include.
+        """
+
+        def health():
+            bind_request_id_from_headers(flask_req.headers)
+            return self.create_health_response(last_n=last_n)
+
+        app.add_url_rule(path, endpoint="authlib_health", view_func=health)
+        return app
 
     def handle_response(self, status_code, payload, headers):
         if isinstance(payload, dict):

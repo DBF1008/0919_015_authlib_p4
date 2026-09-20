@@ -1,6 +1,8 @@
 from starlette.datastructures import URL
 from starlette.responses import RedirectResponse
 
+from authlib.common.log_context import bind_request_id_from_headers
+
 from ..base_client import BaseApp
 from ..base_client import OAuthError
 from ..base_client.async_app import AsyncOAuth1Mixin
@@ -8,6 +10,24 @@ from ..base_client.async_app import AsyncOAuth2Mixin
 from ..base_client.async_openid import AsyncOpenIDMixin
 from ..httpx_client import AsyncOAuth1Client
 from ..httpx_client import AsyncOAuth2Client
+
+
+def _record_token_metrics(app, outcome, error=None):
+    metrics = getattr(app, "token_metrics", None)
+    if metrics is None:
+        return
+    if outcome == "success":
+        metrics.record_success(app.name)
+    else:
+        metrics.record_failure(app.name, error=error)
+
+
+def _bind_request_id(request):
+    try:
+        headers = request.headers
+    except (KeyError, AttributeError):
+        headers = None
+    bind_request_id_from_headers(headers)
 
 
 class StarletteAppMixin:
@@ -38,6 +58,16 @@ class StarletteOAuth1App(StarletteAppMixin, AsyncOAuth1Mixin, BaseApp):
     client_cls = AsyncOAuth1Client
 
     async def authorize_access_token(self, request, **kwargs):
+        _bind_request_id(request)
+        try:
+            token = await self._fetch_access_token(request, **kwargs)
+        except Exception as exc:
+            _record_token_metrics(self, "failure", error=exc.__class__.__name__)
+            raise
+        _record_token_metrics(self, "success")
+        return token
+
+    async def _fetch_access_token(self, request, **kwargs):
         params = dict(request.query_params)
         state = params.get("oauth_token")
         if not state:
@@ -105,6 +135,16 @@ class StarletteOAuth2App(
         return state_data
 
     async def authorize_access_token(self, request, **kwargs):
+        _bind_request_id(request)
+        try:
+            token = await self._fetch_access_token(request, **kwargs)
+        except Exception as exc:
+            _record_token_metrics(self, "failure", error=exc.__class__.__name__)
+            raise
+        _record_token_metrics(self, "success")
+        return token
+
+    async def _fetch_access_token(self, request, **kwargs):
         if request.scope.get("method", "GET") == "GET":
             error = request.query_params.get("error")
             if error:

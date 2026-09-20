@@ -1,4 +1,9 @@
+import logging
+
 from authlib.common.errors import ContinueIteration
+from authlib.common.log_context import get_request_id
+from authlib.common.log_context import log_with_context
+from authlib.common.metrics import TokenMetrics
 from authlib.deprecate import deprecate
 
 from .authenticate_client import ClientAuthentication
@@ -13,6 +18,8 @@ from .hooks import hooked
 from .requests import JsonRequest
 from .requests import OAuth2Request
 from .util import scope_to_list
+
+log = logging.getLogger(__name__)
 
 
 class AuthorizationServer(Hookable):
@@ -31,6 +38,7 @@ class AuthorizationServer(Hookable):
         self._token_grants = []
         self._endpoints = {}
         self._extensions = []
+        self._token_metrics = TokenMetrics()
 
     def query_client(self, client_id):
         """Query OAuth client by client_id. The client model class MUST
@@ -70,6 +78,13 @@ class AuthorizationServer(Hookable):
         if not func:
             raise RuntimeError("No configured token generator")
 
+        log_with_context(
+            log,
+            logging.DEBUG,
+            "generating token for grant_type=%s",
+            grant_type,
+            extra={"grant_type": grant_type},
+        )
         return func(
             grant_type=grant_type,
             client=client,
@@ -122,7 +137,15 @@ class AuthorizationServer(Hookable):
         """
         if self._client_auth is None and self.query_client:
             self._client_auth = ClientAuthentication(self.query_client)
-        return self._client_auth(request, methods, endpoint)
+        client = self._client_auth(request, methods, endpoint)
+        log_with_context(
+            log,
+            logging.DEBUG,
+            "client authenticated on %s endpoint",
+            endpoint,
+            extra={"endpoint": endpoint},
+        )
+        return client
 
     def register_client_auth_method(self, method, func):
         """Add more client auth method. The default methods are:
@@ -398,17 +421,72 @@ class AuthorizationServer(Hookable):
         try:
             grant = self.get_token_grant(request)
         except UnsupportedGrantTypeError as error:
+            self._token_metrics.record_failure(
+                request.payload.grant_type, error=error.error
+            )
             return self.handle_error_response(request, error)
 
         try:
             grant.validate_token_request()
             args = grant.create_token_response()
+            self._token_metrics.record_success(
+                grant.GRANT_TYPE or request.payload.grant_type
+            )
             return self.handle_response(*args)
         except OAuth2Error as error:
+            self._token_metrics.record_failure(
+                request.payload.grant_type, error=error.error
+            )
             return self.handle_error_response(request, error)
 
     def handle_error_response(self, request, error):
         return self.handle_response(*error(self.get_error_uri(request, error)))
+
+    def get_health_status(self, last_n=10):
+        """Build a JSON-serializable health status payload. The payload
+        contains the token signer (key) status, the registered grant
+        types, and the token issuance success/failure counters with the
+        most recent ``last_n`` events.
+
+        This method does not depend on any grant or token validation and
+        is safe to expose on a health-check endpoint.
+
+        :param last_n: number of recent token issuance events to include.
+        """
+        return {
+            "status": "ok",
+            "request_id": get_request_id(),
+            "token_signer": self._describe_token_signers(),
+            "grants": {
+                "authorization": [
+                    _describe_grant(grant_cls)
+                    for grant_cls, _ in self._authorization_grants
+                ],
+                "token": [
+                    _describe_grant(grant_cls) for grant_cls, _ in self._token_grants
+                ],
+            },
+            "token_issuance": self._token_metrics.snapshot(last_n),
+        }
+
+    def create_health_response(self, request=None, last_n=10):
+        """Create an HTTP response for a ``/health`` endpoint. The
+        endpoint itself performs no grant or token validation.
+
+        :param request: HTTP request instance (unused, kept for a
+            consistent framework view signature).
+        :param last_n: number of recent token issuance events to include.
+        """
+        payload = self.get_health_status(last_n=last_n)
+        return self.handle_response(
+            200, payload, [("Content-Type", "application/json")]
+        )
+
+    def _describe_token_signers(self):
+        signers = {}
+        for grant_type, generator in self._token_generators.items():
+            signers[grant_type] = _describe_token_generator(generator)
+        return signers
 
 
 def _create_grant(grant_cls, extensions, request, server):
@@ -417,3 +495,33 @@ def _create_grant(grant_cls, extensions, request, server):
         for ext in extensions:
             ext(grant)
     return grant
+
+
+def _describe_grant(grant_cls):
+    return {
+        "name": grant_cls.__name__,
+        "grant_type": getattr(grant_cls, "GRANT_TYPE", None),
+    }
+
+
+def _describe_token_generator(generator):
+    info = {
+        "configured": generator is not None,
+        "type": type(generator).__name__,
+    }
+    key = None
+    for attr in ("key", "secret_key", "private_key"):
+        if getattr(generator, attr, None):
+            key = attr
+            break
+    info["key_status"] = "loaded" if key else "not_required"
+    if hasattr(generator, "access_token_generator"):
+        info["access_token_generator"] = (
+            "configured" if generator.access_token_generator else "missing"
+        )
+        info["refresh_token_generator"] = (
+            "configured"
+            if getattr(generator, "refresh_token_generator", None)
+            else "disabled"
+        )
+    return info

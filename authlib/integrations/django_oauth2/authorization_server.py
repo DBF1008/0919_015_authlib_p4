@@ -3,6 +3,7 @@ from django.http import HttpResponse
 from django.utils.module_loading import import_string
 
 from authlib.common.encoding import json_dumps
+from authlib.common.log_context import bind_request_id_from_headers
 from authlib.common.security import generate_token as _generate_token
 from authlib.oauth2 import AuthorizationServer as _AuthorizationServer
 from authlib.oauth2.rfc6750 import BearerTokenGenerator
@@ -59,10 +60,24 @@ class AuthorizationServer(_AuthorizationServer):
         return item
 
     def create_oauth2_request(self, request):
+        bind_request_id_from_headers(_get_request_headers(request))
         return DjangoOAuth2Request(request)
 
     def create_json_request(self, request):
+        bind_request_id_from_headers(_get_request_headers(request))
         return DjangoJsonRequest(request)
+
+    def create_health_response(self, request=None, last_n=10):
+        """Create a Django ``HttpResponse`` for a ``/health`` endpoint.
+        Wire it into ``urls.py`` directly::
+
+            path("health", server.create_health_response)
+
+        The endpoint performs no grant or token validation.
+        """
+        if request is not None:
+            bind_request_id_from_headers(_get_request_headers(request))
+        return super().create_health_response(request, last_n=last_n)
 
     def handle_response(self, status_code, payload, headers):
         if isinstance(payload, dict):
@@ -120,3 +135,13 @@ def create_token_expires_in_generator(expires_in_conf=None):
         return data.get(grant_type, BearerTokenGenerator.DEFAULT_EXPIRES_IN)
 
     return expires_in
+
+
+def _get_request_headers(request):
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        return headers
+    meta = getattr(request, "META", None)
+    if meta is not None:
+        return {"X-Request-ID": meta.get("HTTP_X_REQUEST_ID")}
+    return None
