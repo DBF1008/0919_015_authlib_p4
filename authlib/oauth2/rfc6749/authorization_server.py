@@ -1,4 +1,10 @@
 from authlib.common.errors import ContinueIteration
+from authlib.common.health import build_health_snapshot
+from authlib.common.log_context import ensure_request_id
+from authlib.common.log_context import extract_request_id
+from authlib.common.log_context import reset_request_id
+from authlib.common.metrics import get_metrics
+from authlib.common.structured_logging import get_logger
 from authlib.deprecate import deprecate
 
 from .authenticate_client import ClientAuthentication
@@ -14,6 +20,8 @@ from .requests import JsonRequest
 from .requests import OAuth2Request
 from .util import scope_to_list
 
+log = get_logger(__name__)
+
 
 class AuthorizationServer(Hookable):
     """Authorization server that handles Authorization Endpoint and Token
@@ -22,9 +30,13 @@ class AuthorizationServer(Hookable):
     :param scopes_supported: A list of supported scopes by this authorization server.
     """
 
+    #: Component name used for metrics and health reporting.
+    _metrics_component = "authorization_server"
+
     def __init__(self, scopes_supported=None):
         super().__init__()
         self.scopes_supported = scopes_supported
+        self.metrics = get_metrics(self._metrics_component)
         self._token_generators = {}
         self._client_auth = None
         self._authorization_grants = []
@@ -395,17 +407,77 @@ class AuthorizationServer(Hookable):
         :param request: HTTP request instance
         """
         request = self.create_oauth2_request(request)
+        # Bind the request id (from the ``X-Request-ID`` header, or
+        # generated) so the whole authenticate_client / generate_token /
+        # grant validate+create chain shares the same log context.
+        request_id, token = ensure_request_id(extract_request_id(request.headers))
         try:
-            grant = self.get_token_grant(request)
-        except UnsupportedGrantTypeError as error:
-            return self.handle_error_response(request, error)
+            try:
+                grant = self.get_token_grant(request)
+            except UnsupportedGrantTypeError as error:
+                self._record_token_issuance(
+                    False, request, error=error.error, request_id=request_id
+                )
+                return self.handle_error_response(request, error)
 
-        try:
-            grant.validate_token_request()
-            args = grant.create_token_response()
-            return self.handle_response(*args)
-        except OAuth2Error as error:
-            return self.handle_error_response(request, error)
+            try:
+                grant.validate_token_request()
+                args = grant.create_token_response()
+                self._record_token_issuance(True, request, request_id=request_id)
+                log.info(
+                    "token issued",
+                    extra={
+                        "event": "token_issued",
+                        "grant_type": request.payload.grant_type,
+                    },
+                )
+                return self.handle_response(*args)
+            except OAuth2Error as error:
+                self._record_token_issuance(
+                    False, request, error=error.error, request_id=request_id
+                )
+                log.warning(
+                    "token issuance failed",
+                    extra={
+                        "event": "token_issuance_failed",
+                        "grant_type": request.payload.grant_type,
+                        "error": error.error,
+                    },
+                )
+                return self.handle_error_response(request, error)
+        finally:
+            reset_request_id(token)
+
+    def _record_token_issuance(self, success, request, error=None, request_id=None):
+        self.metrics.record(
+            success,
+            grant_type=request.payload.grant_type,
+            request_id=request_id,
+            error=error,
+        )
+
+    def get_registered_grant_types(self):
+        """Return the list of grant types registered on the token endpoint."""
+        grant_types = []
+        for grant_cls, _ in self._token_grants:
+            if grant_cls.GRANT_TYPE:
+                grant_types.append(grant_cls.GRANT_TYPE)
+        return grant_types
+
+    def create_health_snapshot(self, last_n=None):
+        """Build the health check payload for this server.
+
+        The snapshot reports signer key state, registered grant types and
+        recent token issuance counters; it never performs grant or token
+        validation.
+        """
+        return build_health_snapshot(
+            grant_types=self.get_registered_grant_types(),
+            token_generators=self._token_generators,
+            metrics=self.metrics,
+            last_n=last_n,
+            component=self._metrics_component,
+        )
 
     def handle_error_response(self, request, error):
         return self.handle_response(*error(self.get_error_uri(request, error)))

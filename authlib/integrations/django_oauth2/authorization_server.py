@@ -3,6 +3,10 @@ from django.http import HttpResponse
 from django.utils.module_loading import import_string
 
 from authlib.common.encoding import json_dumps
+from authlib.common.log_context import REQUEST_ID_HEADER
+from authlib.common.log_context import ensure_request_id
+from authlib.common.log_context import extract_request_id
+from authlib.common.log_context import reset_request_id
 from authlib.common.security import generate_token as _generate_token
 from authlib.oauth2 import AuthorizationServer as _AuthorizationServer
 from authlib.oauth2.rfc6750 import BearerTokenGenerator
@@ -22,6 +26,9 @@ class AuthorizationServer(_AuthorizationServer):
 
         server = AuthorizationServer(OAuth2Client, OAuth2Token)
     """
+
+    #: Component name used for metrics and health reporting.
+    _metrics_component = "django_authorization_server"
 
     def __init__(self, client_model, token_model):
         super().__init__()
@@ -71,6 +78,27 @@ class AuthorizationServer(_AuthorizationServer):
         for k, v in headers:
             resp[k] = v
         return resp
+
+    def create_health_response(self, request=None):
+        """Django ``GET /health`` view. Wire it into your URLconf::
+
+            urlpatterns = [path("health", server.create_health_response)]
+
+        It reports signer key state, registered grant types and recent
+        token issuance counters, and never performs grant or token
+        validation.
+        """
+        headers = request.headers if request is not None else None
+        request_id, token = ensure_request_id(extract_request_id(headers))
+        try:
+            snapshot = self.create_health_snapshot()
+            resp = HttpResponse(
+                json_dumps(snapshot), status=200, content_type="application/json"
+            )
+            resp[REQUEST_ID_HEADER] = request_id
+            return resp
+        finally:
+            reset_request_id(token)
 
     def send_signal(self, name, *args, **kwargs):
         if name == "after_authenticate_client":

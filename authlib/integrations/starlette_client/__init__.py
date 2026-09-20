@@ -2,6 +2,7 @@ from ..base_client import BaseOAuth
 from ..base_client import OAuthError
 from .apps import StarletteOAuth1App
 from .apps import StarletteOAuth2App
+from .health import health_endpoint
 from .integration import StarletteIntegration
 
 
@@ -23,4 +24,5 @@ __all__ = [
     "StarletteIntegration",
     "StarletteOAuth1App",
     "StarletteOAuth2App",
+    "health_endpoint",
 ]

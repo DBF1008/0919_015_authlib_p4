@@ -1,8 +1,14 @@
 from flask import Response
+from flask import g
 from flask import json
 from flask import request as flask_req
 from werkzeug.utils import import_string
 
+from authlib.common.log_context import REQUEST_ID_HEADER
+from authlib.common.log_context import ensure_request_id
+from authlib.common.log_context import extract_request_id
+from authlib.common.log_context import get_request_id
+from authlib.common.log_context import reset_request_id
 from authlib.common.security import generate_token
 from authlib.oauth2 import AuthorizationServer as _AuthorizationServer
 from authlib.oauth2.rfc6750 import BearerTokenGenerator
@@ -39,6 +45,9 @@ class AuthorizationServer(_AuthorizationServer):
         server.init_app(app, query_client, save_token)
     """
 
+    #: Component name used for metrics and health reporting.
+    _metrics_component = "flask_authorization_server"
+
     def __init__(self, app=None, query_client=None, save_token=None):
         super().__init__()
         self._query_client = query_client
@@ -54,6 +63,36 @@ class AuthorizationServer(_AuthorizationServer):
         if save_token is not None:
             self._save_token = save_token
         self.load_config(app.config)
+        self._register_observability(app)
+
+    def _register_observability(self, app):
+        """Register request-id tracking and the ``/health`` endpoint."""
+        state = app.extensions.setdefault("authlib_observability", {})
+        if "request_id" not in state:
+            app.before_request(_bind_request_id)
+            app.after_request(_echo_request_id)
+            app.teardown_request(_reset_request_id)
+            state["request_id"] = True
+        if "health" not in state:
+            app.add_url_rule(
+                "/health",
+                endpoint="authlib_health",
+                view_func=self.create_health_response,
+                methods=["GET"],
+            )
+            state["health"] = True
+
+    def create_health_response(self, last_n=None):
+        """Flask ``GET /health`` view. It reports signer key state,
+        registered grant types and recent token issuance counters, and
+        never performs grant or token validation.
+        """
+        snapshot = self.create_health_snapshot(last_n=last_n)
+        return Response(
+            json.dumps(snapshot),
+            status=200,
+            headers={"Content-Type": "application/json"},
+        )
 
     def load_config(self, config):
         self.register_token_generator(
@@ -163,3 +202,24 @@ def create_token_generator(token_generator_conf, length=42):
             return generate_token(length)
 
         return token_generator
+
+
+def _bind_request_id():
+    """Flask ``before_request`` handler binding the request id."""
+    _, token = ensure_request_id(extract_request_id(flask_req.headers))
+    g._authlib_request_id_token = token
+
+
+def _echo_request_id(response):
+    """Flask ``after_request`` handler echoing the request id header."""
+    request_id = get_request_id()
+    if request_id:
+        response.headers[REQUEST_ID_HEADER] = request_id
+    return response
+
+
+def _reset_request_id(exc=None):
+    """Flask ``teardown_request`` handler cleaning up the log context."""
+    token = g.pop("_authlib_request_id_token", None)
+    if token is not None:
+        reset_request_id(token)
